@@ -2,33 +2,37 @@ import os, time, json, re, ctypes
 import cv2
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-# -----------------------------
-# RealSense
-# -----------------------------
+import mediapipe as mp
 import pyrealsense2 as rs
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-ACTOR_VIDEO_PATH = r"input\actor.mp4" # UPDATED TO VIDEO
+ACTOR_VIDEO_PATH = r"input\actor.mp4"
 
-# ---- SLOW / STEADY CONTROL ----
-SMOOTHING = 0.15          
-MAX_DOT_SPEED_PX_S = 500  
-DEADZONE_PX = 6           
+# Gaze Smoothing
+SMOOTHING = 0.15
+MAX_DOT_SPEED_PX_S = 500
+DEADZONE_PX = 6
 
-# Fixation / saccade settings
+# Fixation Settings
 VEL_THRESH_PX_PER_SEC = 250
 MIN_FIX_DUR_SEC = 0.20
 
+# Haar Cascades for USER eye tracking (RealSense)
 FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 EYE_CASCADE  = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 
-# -----------------------------
-# AOI labels 
-# -----------------------------
+# MediaPipe Setup for ACTOR tracking (Video)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False, 
+    max_num_faces=1, 
+    refine_landmarks=True, 
+    min_detection_confidence=0.5
+)
+
+# EXACT 17 AOIs AS REQUESTED
 AOI_LABELS = [
     "RIGHT_EYEBROW", "LEFT_EYEBROW",
     "RIGHT_EYE", "LEFT_EYE",
@@ -36,8 +40,7 @@ AOI_LABELS = [
     "NOSE", "LIPS",
     "FOREHEAD", "CHIN",
     "RIGHT_CHEEK", "LEFT_CHEEK",
-    "HAIR",
-    "NECK",
+    "HAIR", "NECK",
     "RIGHT_SHOULDER", "LEFT_SHOULDER",
     "FULL_FACE"
 ]
@@ -57,15 +60,27 @@ AOI_PRIORITY = [
 
 OUTSIDE_ACTOR_XY_TO_ZERO = True
 
+# MediaPipe Index Mapping for precise internal facial features
+# Note: "Right" and "Left" in AI refers to the image axis (Actor's Right = Screen Left)
+MP_INDICES = {
+    "RIGHT_EYEBROW": [46, 53, 52, 65, 55, 70, 63, 105, 66, 107],
+    "LEFT_EYEBROW": [276, 283, 282, 295, 285, 300, 293, 334, 296, 336],
+    "RIGHT_EYE": [33, 160, 158, 133, 153, 144],
+    "LEFT_EYE": [362, 385, 387, 263, 373, 380],
+    "NOSE": [168, 197, 5, 4, 19, 94, 2, 278, 344, 440, 275, 220, 45, 274],
+    "LIPS": [61, 39, 0, 269, 291, 405, 17, 181],
+    "FOREHEAD": [103, 67, 109, 10, 338, 297, 332, 285, 295, 282, 283, 276, 168, 46, 53, 52, 65, 55],
+    "CHIN": [150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 435, 367, 364, 394, 395, 369, 396, 175, 200, 201, 208, 171, 140, 170, 169, 210, 212, 214, 192, 213, 147, 123, 117, 118, 101, 50, 36, 205, 206, 207, 216],
+    "RIGHT_CHEEK": [137, 234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 200, 201, 208, 171, 140, 170, 169, 210, 212, 214, 192, 213, 147, 123, 117, 118, 101, 50, 36, 205, 206, 207, 216],
+    "LEFT_CHEEK": [366, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109],
+    "FULL_FACE": [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+}
+
 # -----------------------------
 # Helpers
 # -----------------------------
 def safe_name(s: str) -> str:
-    s = s.strip()
-    if not s:
-        return "UNKNOWN"
-    s = re.sub(r'[^a-zA-Z0-9_\-]+', "_", s)
-    return s[:60]
+    return re.sub(r'[^a-zA-Z0-9_\-]+', "_", s.strip())[:60] if s.strip() else "UNKNOWN"
 
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
@@ -73,20 +88,6 @@ def ensure_dir(p):
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
-def clamp_point(x, y, w, h):
-    return (max(0, min(int(x), w - 1)), max(0, min(int(y), h - 1)))
-
-def centroid(points_np: np.ndarray):
-    cx = int(np.mean(points_np[:, 0]))
-    cy = int(np.mean(points_np[:, 1]))
-    return cx, cy
-
-def point_in_poly(px, py, poly_pts):
-    if poly_pts is None or len(poly_pts) < 3:
-        return False
-    cnt = np.array(poly_pts, dtype=np.int32).reshape((-1, 1, 2))
-    return cv2.pointPolygonTest(cnt, (float(px), float(py)), False) >= 0
 
 def get_screen_size():
     user32 = ctypes.windll.user32
@@ -98,125 +99,11 @@ def show_fullscreen(window_name):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-# -----------------------------
-# AOI Annotation 
-# -----------------------------
-def draw_polygons(base_img, polygons, current_label=None, current_points=None):
-    img = base_img.copy()
-    h, w = img.shape[:2]
+def point_in_poly(px, py, poly_pts):
+    if not poly_pts: return False
+    cnt = np.array(poly_pts, dtype=np.int32).reshape((-1, 1, 2))
+    return cv2.pointPolygonTest(cnt, (float(px), float(py)), False) >= 0
 
-    for label, pts in polygons.items():
-        if pts is None or len(pts) < 3:
-            continue
-        poly = np.array(pts, dtype=np.int32)
-        cv2.polylines(img, [poly], isClosed=True, color=(0, 255, 0), thickness=2)
-        cx, cy = centroid(poly)
-        cv2.putText(img, label, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    if current_label is not None:
-        cv2.putText(img, f"Drawing: {current_label}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-    if current_points is not None and len(current_points) > 0:
-        for p in current_points:
-            cv2.circle(img, tuple(p), 4, (0, 255, 255), -1)
-        if len(current_points) >= 2:
-            cv2.polylines(img, [np.array(current_points, dtype=np.int32)],
-                          isClosed=False, color=(0, 255, 255), thickness=2)
-
-    cv2.putText(
-        img,
-        "Left click:add | N:save+next | U:undo | R:reset | S:save | Q:quit",
-        (10, h - 15),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        2
-    )
-    return img
-
-def save_master_aoi(master_json_path, overlay_path, base_img, polygons, actor_shape):
-    data = {
-        "video_path": ACTOR_VIDEO_PATH,
-        "image_shape_hw": [int(actor_shape[0]), int(actor_shape[1])],
-        "polygons": polygons
-    }
-    with open(master_json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    print(f"[OK] Saved MASTER AOIs to: {master_json_path}")
-
-    overlay = draw_polygons(base_img, polygons)
-    cv2.imwrite(overlay_path, overlay)
-    print(f"[OK] Saved MASTER overlay to: {overlay_path}")
-
-def load_master_aoi(master_json_path):
-    if not os.path.exists(master_json_path):
-        return None
-    with open(master_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    polys = data.get("polygons", {})
-    out = {}
-    for k, pts in polys.items():
-        if pts is None:
-            out[k] = None
-        else:
-            out[k] = [(int(p[0]), int(p[1])) for p in pts]
-    return out
-
-def annotate_master_aoi_once(base_img, master_json_path, overlay_path):
-    h, w = base_img.shape[:2]
-    polygons = {}
-
-    idx = 0
-    current_label = AOI_LABELS[idx]
-    current_points = []
-
-    win = "MASTER AOI Annotator (First Frame of Video)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-
-    def on_mouse(event, x, y, flags, param):
-        nonlocal current_points
-        if event == cv2.EVENT_LBUTTONDOWN:
-            x2, y2 = clamp_point(x, y, w, h)
-            current_points.append([int(x2), int(y2)])
-
-    cv2.setMouseCallback(win, on_mouse)
-
-    print("\n=== MASTER AOI Annotation (ONE TIME) ===")
-    while True:
-        canvas = draw_polygons(base_img, polygons, current_label, current_points)
-        cv2.imshow(win, canvas)
-
-        key = cv2.waitKey(10) & 0xFF
-
-        if key == ord('q'):
-            save_master_aoi(master_json_path, overlay_path, base_img, polygons, base_img.shape)
-            break
-        elif key == ord('u'):
-            if current_points:
-                current_points.pop()
-        elif key == ord('r'):
-            current_points = []
-        elif key == ord('s'):
-            save_master_aoi(master_json_path, overlay_path, base_img, polygons, base_img.shape)
-        elif key == ord('n'):
-            if len(current_points) < 3:
-                print("[WARN] Need at least 3 points.")
-                continue
-            polygons[current_label] = current_points.copy()
-            current_points = []
-            idx += 1
-            if idx >= len(AOI_LABELS):
-                save_master_aoi(master_json_path, overlay_path, base_img, polygons, base_img.shape)
-                break
-            current_label = AOI_LABELS[idx]
-
-    cv2.destroyWindow(win)
-    return polygons
-
-# -----------------------------
-# AOI classification
-# -----------------------------
 def classify_aoi_poly(ax, ay, aois_poly):
     for name in AOI_PRIORITY:
         if name in aois_poly and point_in_poly(ax, ay, aois_poly[name]):
@@ -226,14 +113,90 @@ def classify_aoi_poly(ax, ay, aois_poly):
 def draw_polys(img, aois_poly, color=(0, 255, 0), thickness=2):
     out = img.copy()
     for name, pts in aois_poly.items():
-        if pts is None or len(pts) < 3:
-            continue
+        if not pts: continue
         cnt = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
         cv2.polylines(out, [cnt], isClosed=True, color=color, thickness=thickness)
     return out
 
 # -----------------------------
-# Eye feature & Calibration logic remains unchanged
+# DYNAMIC AOI GENERATOR (17 AOIs)
+# -----------------------------
+def extract_dynamic_aois(frame_bgr):
+    """Processes frame via MediaPipe. Uses exact indices for facial features, 
+       and anchors geometric boxes for Hair, Neck, Shoulders, and Ears."""
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(frame_rgb)
+    
+    aois = {label: [] for label in AOI_LABELS}
+    if not results.multi_face_landmarks:
+        return aois
+
+    h, w = frame_bgr.shape[:2]
+    landmarks = results.multi_face_landmarks[0].landmark
+    
+    # 1. Map internal facial features using precise indices
+    for aoi_name, indices in MP_INDICES.items():
+        pts = []
+        for idx in indices:
+            # Prevent points from crossing frame boundaries
+            lx = clamp(int(landmarks[idx].x * w), 0, w-1)
+            ly = clamp(int(landmarks[idx].y * h), 0, h-1)
+            pts.append((lx, ly))
+        aois[aoi_name] = pts
+
+    # 2. Extrapolate external features based on the FULL_FACE bounding box
+    if aois["FULL_FACE"]:
+        face_pts = np.array(aois["FULL_FACE"])
+        x_min, y_min = np.min(face_pts, axis=0)
+        x_max, y_max = np.max(face_pts, axis=0)
+        fw, fh = x_max - x_min, y_max - y_min
+
+        # HAIR: Box directly above the top of the face mesh
+        aois["HAIR"] = [
+            (x_min, y_min - int(fh*0.35)), (x_max, y_min - int(fh*0.35)),
+            (x_max, y_min), (x_min, y_min)
+        ]
+        
+        # NECK: Box directly below the chin
+        aois["NECK"] = [
+            (x_min + int(fw*0.2), y_max), (x_max - int(fw*0.2), y_max),
+            (x_max - int(fw*0.2), y_max + int(fh*0.35)), (x_min + int(fw*0.2), y_max + int(fh*0.35))
+        ]
+
+        # SHOULDERS: Boxes expanding outward and downward from the neck
+        aois["RIGHT_SHOULDER"] = [
+            (max(0, x_min - int(fw*0.5)), y_max + int(fh*0.1)), 
+            (x_min + int(fw*0.2), y_max + int(fh*0.1)),
+            (x_min + int(fw*0.2), min(h-1, y_max + fh)), 
+            (max(0, x_min - int(fw*0.5)), min(h-1, y_max + fh))
+        ]
+        
+        aois["LEFT_SHOULDER"] = [
+            (x_max - int(fw*0.2), y_max + int(fh*0.1)), 
+            (min(w-1, x_max + int(fw*0.5)), y_max + int(fh*0.1)),
+            (min(w-1, x_max + int(fw*0.5)), min(h-1, y_max + fh)), 
+            (x_max - int(fw*0.2), min(h-1, y_max + fh))
+        ]
+
+        # EARS: Small boxes attached to the extreme left/right of the face mesh
+        aois["RIGHT_EAR"] = [
+            (max(0, x_min - int(fw*0.15)), y_min + int(fh*0.35)), 
+            (x_min, y_min + int(fh*0.35)),
+            (x_min, y_min + int(fh*0.65)), 
+            (max(0, x_min - int(fw*0.15)), y_min + int(fh*0.65))
+        ]
+        
+        aois["LEFT_EAR"] = [
+            (x_max, y_min + int(fh*0.35)), 
+            (min(w-1, x_max + int(fw*0.15)), y_min + int(fh*0.35)),
+            (min(w-1, x_max + int(fw*0.15)), y_min + int(fh*0.65)), 
+            (x_max, y_min + int(fh*0.65))
+        ]
+
+    return aois
+
+# -----------------------------
+# USER EYE TRACKING & CALIBRATION (RealSense)
 # -----------------------------
 def get_pupil_center(eye_gray):
     eye_blur = cv2.GaussianBlur(eye_gray, (7, 7), 0)
@@ -280,7 +243,6 @@ def run_calibration(pipeline, align, calib_bg_image, out_calib_path):
     margin = 0.12
     targets = [(int(x * SCREEN_W), int(y * SCREEN_H)) for y in [margin, 0.5, 1.0 - margin] for x in [margin, 0.5, 1.0 - margin]]
     samples_f, samples_t = [], []
-
     idx = 0
     while idx < len(targets):
         frames = align.process(pipeline.wait_for_frames())
@@ -305,13 +267,14 @@ def run_calibration(pipeline, align, calib_bg_image, out_calib_path):
                 samples_f.append(f); samples_t.append([tx, ty]); idx += 1
 
     W = fit_affine(np.array(samples_f, dtype=np.float32), np.array(samples_t, dtype=np.float32))
-    calib = {"W": W.tolist(), "screen_w": SCREEN_W, "screen_h": SCREEN_H}
-    with open(out_calib_path, "w", encoding="utf-8") as f: json.dump(calib, f, indent=2)
+    with open(out_calib_path, "w", encoding="utf-8") as f: 
+        json.dump({"W": W.tolist(), "screen_w": SCREEN_W, "screen_h": SCREEN_H}, f, indent=2)
     return W
 
 def load_calibration(path):
     if not os.path.exists(path): return None
-    with open(path, "r", encoding="utf-8") as f: return np.array(json.load(f)["W"], dtype=np.float32)
+    with open(path, "r", encoding="utf-8") as f: 
+        return np.array(json.load(f)["W"], dtype=np.float32)
 
 def slow_follow(prev_x, prev_y, target_x, target_y, dt):
     if prev_x is None: return int(target_x), int(target_y)
@@ -328,45 +291,25 @@ def slow_follow(prev_x, prev_y, target_x, target_y, dt):
     return int(sx), int(sy)
 
 # -----------------------------
-# MAIN
+# MAIN LOOP
 # -----------------------------
 def main():
     patient_id = safe_name(input("Enter Patient ID (ex: P001): "))
     session_name = safe_name(input("Enter Session Name (ex: session_001): ") or "session_001")
 
-    patient_dir = ensure_dir(os.path.join("output", patient_id))
-    master_dir  = ensure_dir(os.path.join(patient_dir, "_MASTER"))
-    session_dir = ensure_dir(os.path.join(patient_dir, session_name))
+    session_dir = ensure_dir(os.path.join("output", patient_id, session_name))
+    calib_json_path = os.path.join(session_dir, "calibration.json")
 
     # --- VIDEO SETUP ---
     cap = cv2.VideoCapture(ACTOR_VIDEO_PATH)
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Video not found or cannot be opened: {ACTOR_VIDEO_PATH}")
-    
-    # Read the very first frame to establish scale and allow AOI drawing
+    if not cap.isOpened(): raise FileNotFoundError("Video not found.")
     ret, first_frame = cap.read()
-    if not ret:
-        raise ValueError("Video is empty.")
-    
     ah, aw = first_frame.shape[:2]
-    first_frame_full = cv2.resize(first_frame, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
+    first_frame_full = cv2.resize(first_frame, (SCREEN_W, SCREEN_H))
 
-    # MASTER AOI paths 
-    master_aoi_json = os.path.join(master_dir, "aois_polygons_master.json")
-    master_overlay  = os.path.join(master_dir, "aoi_overlay_master.png")
-    calib_json_path = os.path.join(session_dir, "calibration.json")
-
-    # 1) Load or create MASTER AOIs (Using the first frame of the video)
-    aois_poly = load_master_aoi(master_aoi_json)
-    if aois_poly is None:
-        print("Starting ONE-TIME manual AOI annotation on the first frame of the video...\n")
-        annotate_master_aoi_once(first_frame, master_aoi_json, master_overlay)
-        aois_poly = load_master_aoi(master_aoi_json)
-
-    # 2) Load session calibration
     W = load_calibration(calib_json_path)
 
-    # RealSense setup
+    # --- REALSENSE SETUP ---
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
@@ -379,56 +322,43 @@ def main():
 
     rows = []
     prev_t, prev_sx, prev_sy = None, None, None
-    fixation_id = 0
-    fix_start_t = None
-    in_fixation = False
-
+    fixation_id, in_fixation = 0, False
     start_time = time.time()
     tracking_frame_index = 0
 
     try:
         while True:
-            # --- READ VIDEO FRAME ---
+            # 1. READ VIDEO
             ret, vid_frame = cap.read()
             if not ret:
-                # Video ended, loop back to the beginning
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, vid_frame = cap.read()
-            
-            # Get current video frame index for data logging
             current_vid_frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-            # Resize the video frame to fill the screen
-            display = cv2.resize(vid_frame, (SCREEN_W, SCREEN_H), interpolation=cv2.INTER_LINEAR)
+            # 2. DYNAMICALLY GENERATE 17 AOIs
+            dynamic_aois = extract_dynamic_aois(vid_frame)
+            display = cv2.resize(vid_frame, (SCREEN_W, SCREEN_H))
 
-            # --- READ WEBCAM FRAME ---
+            # 3. READ REALSENSE
             frames = align.process(pipeline.wait_for_frames())
             depth_frame = frames.get_depth_frame()
             color_frame = frames.get_color_frame()
-            if not depth_frame or not color_frame:
-                continue
+            if not depth_frame or not color_frame: continue
 
-            color = np.asanyarray(color_frame.get_data())
-            gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
-
+            gray = cv2.cvtColor(np.asanyarray(color_frame.get_data()), cv2.COLOR_BGR2GRAY)
             t = time.time()
-            if prev_t is None: prev_t = t
-            dt = max(1e-3, t - prev_t)
+            dt = max(1e-3, t - (prev_t if prev_t else t))
 
-            # draw AOIs (scaled) on top of the playing video
-            if aois_poly is not None:
-                sx_scale = SCREEN_W / float(aw)
-                sy_scale = SCREEN_H / float(ah)
-                aois_screen = {k: (None if pts is None else [(int(p[0]*sx_scale), int(p[1]*sy_scale)) for p in pts]) 
-                               for k, pts in aois_poly.items()}
-                display = draw_polys(display, aois_screen, color=(0, 255, 0), thickness=2)
+            # Scale and draw the dynamically generated AOIs to the screen resolution
+            if dynamic_aois:
+                sx_scale, sy_scale = SCREEN_W / float(aw), SCREEN_H / float(ah)
+                aois_screen = {k: [(int(p[0]*sx_scale), int(p[1]*sy_scale)) for p in pts] for k, pts in dynamic_aois.items()}
+                display = draw_polys(display, aois_screen, color=(0, 255, 0), thickness=1)
 
             k = cv2.waitKey(1) & 0xFF
             if k == ord('q') or k == 27: break
             if k == ord('c'):
-                # Pass the static first frame for calibration so the user isn't distracted by a moving video
-                W2 = run_calibration(pipeline, align, first_frame_full, calib_json_path)
-                if W2 is not None: W = W2
+                W = run_calibration(pipeline, align, first_frame_full, calib_json_path) or W
                 continue
 
             if W is None:
@@ -437,36 +367,24 @@ def main():
                 prev_t = t
                 continue
 
+            # 4. PREDICT USER GAZE
             f = extract_eye_features(gray)
             if f is None:
-                cv2.putText(display, "Face/Eyes not detected", (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 4)
                 cv2.imshow(win, display)
                 prev_t = t
                 continue
 
-            # Gaze mapping & Smoothing
             sx_pred, sy_pred = apply_affine(W, f)
-            sx_pred = clamp(int(sx_pred), 0, SCREEN_W - 1)
-            sy_pred = clamp(int(sy_pred), 0, SCREEN_H - 1)
-            sx_slow, sy_slow = slow_follow(prev_sx, prev_sy, sx_pred, sy_pred, dt)
-
-            # depth
+            sx_slow, sy_slow = slow_follow(prev_sx, prev_sy, clamp(int(sx_pred), 0, SCREEN_W - 1), clamp(int(sy_pred), 0, SCREEN_H - 1), dt)
+            
+            # 5. CLASSIFY GAZE AGAINST DYNAMIC AOIS
+            ax, ay = clamp(int((sx_slow / float(SCREEN_W)) * aw), 0, aw - 1), clamp(int((sy_slow / float(SCREEN_H)) * ah), 0, ah - 1)
+            aoi = classify_aoi_poly(ax, ay, dynamic_aois) if dynamic_aois else "OUTSIDE"
+            
+            out_actor_x, out_actor_y = (0, 0) if (OUTSIDE_ACTOR_XY_TO_ZERO and aoi == "OUTSIDE") else (ax, ay)
             depth_m = float(depth_frame.get_distance(320, 240))
 
-            # screen -> actor coords (original video resolution)
-            ax = clamp(int((sx_slow / float(SCREEN_W)) * aw), 0, aw - 1)
-            ay = clamp(int((sy_slow / float(SCREEN_H)) * ah), 0, ah - 1)
-
-            # Classify AOI
-            aoi = "OUTSIDE"
-            if aois_poly is not None:
-                aoi = classify_aoi_poly(ax, ay, aois_poly)
-
-            out_actor_x, out_actor_y = ax, ay
-            if OUTSIDE_ACTOR_XY_TO_ZERO and aoi == "OUTSIDE":
-                out_actor_x, out_actor_y = 0, 0
-
-            # fixation / saccade math
+            # 6. FIXATION LOGIC
             vel, event = np.nan, "NA"
             if prev_sx is not None and dt > 0:
                 vel = (((sx_slow - prev_sx)**2 + (sy_slow - prev_sy)**2)**0.5) / dt
@@ -479,20 +397,17 @@ def main():
                     if in_fixation: event = "FIX_END"
                     in_fixation, fix_start_t, event = False, None, "SACCADE"
 
+            # 7. LOGGING & DISPLAY
             rows.append({
                 "patient_id": patient_id,
                 "session_name": session_name,
                 "tracking_frame": tracking_frame_index,
                 "video_frame": current_vid_frame_idx,
                 "timestamp": t - start_time,
-                "screen_gaze_x": sx_slow,
-                "screen_gaze_y": sy_slow,
-                "actor_x": out_actor_x,
-                "actor_y": out_actor_y,
-                "depth_m": depth_m,
-                "aoi": aoi,
-                "velocity_px_s": vel,
-                "event": event,
+                "screen_gaze_x": sx_slow, "screen_gaze_y": sy_slow,
+                "actor_x": out_actor_x, "actor_y": out_actor_y,
+                "depth_m": depth_m, "aoi": aoi,
+                "velocity_px_s": vel, "event": event,
                 "fixation_id": fixation_id if in_fixation else (fixation_id if event == "FIX_END" else np.nan)
             })
 
@@ -508,30 +423,10 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
 
-    if len(rows) == 0: return
-
-    df = pd.DataFrame(rows)
-    session_dir = ensure_dir(os.path.join("output", patient_id, session_name))
-    
-    # Save Excel
-    df.to_excel(os.path.join(session_dir, "data.xlsx"), index=False)
-
-    # Heatmap (Mapped onto the First Frame of the video)
-    heat = np.zeros((ah, aw), dtype=np.float32)
-    d_ok = df[(df["actor_x"] != 0) & (df["actor_y"] != 0)]
-    for _, r in d_ok.iterrows():
-        x, y = int(r["actor_x"]), int(r["actor_y"])
-        if 0 <= x < aw and 0 <= y < ah: heat[y, x] += 1
-
-    heat_blur = cv2.GaussianBlur(heat, (0, 0), 15)
-    heat_norm = cv2.normalize(heat_blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
-    
-    # Overlay the heatmap on the very first frame of the video
-    overlay = cv2.addWeighted(first_frame, 0.6, heat_color, 0.4, 0)
-    cv2.imwrite(os.path.join(session_dir, "heatmap.png"), overlay)
-
-    print("\nDONE ✅ Data saved in output directory.")
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_excel(os.path.join(session_dir, "data.xlsx"), index=False)
+        print("\nDONE ✅ Data saved in output directory.")
 
 if __name__ == "__main__":
     main()
